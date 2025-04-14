@@ -1,0 +1,902 @@
+ #region CONSULTA_COMPLETA
+
+ [Route("ConsultaCompleta")]
+ [HttpPost]
+ public async Task<ActionResult> ConsultaCompleta([FromBody] Param param)
+ {
+
+     //  List<string> lstDebug = new List<string>();
+     System.DateTime inicioExecucao = System.DateTime.Now;
+     TimeSpan tempoDecorrido = System.DateTime.Now - inicioExecucao;
+
+     bool enviouCoordenadas = false;
+     int IdUsuario = Convert.ToInt32(User.FindFirst(ClaimTypes.NameIdentifier)?.Value);
+     string IpUsuario = "0";
+     string SiebelMunicipio = string.Empty;
+     //IpUsuario = await GetIpUsuario.GetIpUsuarioAsync(IdUsuario);
+
+
+     //
+
+     ViabilidadeEndereco retorno = new ViabilidadeEndereco();
+     ViabilidadeConsulta logConsulta = new ViabilidadeConsulta();
+     List<DisponibilidadeLog> logDetalhe = new List<DisponibilidadeLog>();
+     ViabilidadeJson logJSON = new ViabilidadeJson();
+
+     if (param == null)
+     {
+         _ = SaveDebugAsync("Nenhum parâmetro identificado.").ConfigureAwait(false);
+         return Ok(new
+         {
+             Error = true,
+             Message = "Nenhum parâmetro identificado.",
+             TempoExecucao = GetTempoExecucao(inicioExecucao),
+             Retorno = retorno
+         });
+     }
+
+     param.Cep = GetAux.FormataCEP(param.Cep);
+     if (!GetAux.ValidaCEP(param.Cep))
+     {
+         _ = SaveDebugAsync($"CEP inválido. {param.Cep}").ConfigureAwait(false);
+         return Ok(new
+         {
+             Error = true,
+             Message = "CEP inválido",
+             TempoExecucao = GetTempoExecucao(inicioExecucao),
+             Retorno = retorno
+         });
+     }
+
+     param.Numero = GetAux.FormataNumeroEndereco(param.Numero);
+     if (!GetAux.ValidaNumeroEndereco(param.Numero))
+     {
+         _ = SaveDebugAsync($"Número não identificado no parâmetro ou inválido. {param.Numero}").ConfigureAwait(false);
+         return Ok(new
+         {
+             Error = true,
+             Message = "Número não identificado no parâmetro ou inválido.",
+             TempoExecucao = GetTempoExecucao(inicioExecucao),
+             Retorno = retorno
+         });
+     }
+
+     // Parametros Opcionais
+     if (!string.IsNullOrEmpty(param.Coordenada))
+     {
+         if (!IsCoordenadaValid(ref param))
+         {
+             _ = SaveDebugAsync($"Erro na requisição. Coordenada inválida. {param.Coordenada}").ConfigureAwait(false);
+             return Ok(new
+             {
+                 Error = true,
+                 Message = "Erro na requisição. Coordenada inválida.",
+                 TempoExecucao = GetTempoExecucao(inicioExecucao),
+                 Retorno = retorno
+             });
+         }
+         enviouCoordenadas = true;
+     }
+
+
+     if (string.IsNullOrEmpty(PublicConstants.TokenCobertura) || DateTime.Now >= PublicConstants.TokenCoberturaValidade)
+     {
+         Ambiente ambiente = (Ambiente)Convert.ToInt32(_config["Telefonica:IsProducao"]);
+         string respostaCobertura = await GerenciamentoAPIUtil.RefreshTokenAsync(ApiToken.Cobertura, ambiente, _config).ConfigureAwait(false);
+
+         if (!string.IsNullOrEmpty(respostaCobertura))
+         {
+             _ = SaveDebugAsync($"Não foi possível obter o Token de Cobertura (Zukk). " +
+                 $"Retorno :{respostaCobertura} - " +
+                 $"Ambiente:{ambiente.GetDisplayName}").ConfigureAwait(false);
+             return Ok(new
+             {
+                 Error = true,
+                 Message = "Não foi possível obter o Token de Cobertura.",
+                 TempoExecucao = GetTempoExecucao(inicioExecucao),
+                 Retorno = retorno
+             });
+         }
+     }
+
+     var cep = await Task.Run(() => ConsultaCEP(param));
+     if (cep == null || cep.Count == 0)
+     {
+         _ = SaveDebugAsync($"O CEP {param.Cep} não foi encontrado.").ConfigureAwait(false);
+         return Ok(new
+         {
+             Error = true,
+             Message = $"O CEP {param.Cep} não foi encontrado.",
+             TempoExecucao = GetTempoExecucao(inicioExecucao),
+             Retorno = retorno
+         });
+     }
+
+     //Salva o JSON da consulta
+     logJSON.JsonCep = JsonConvert.SerializeObject(cep);
+
+     retorno.Disponibilidades = new List<Disponibilidade>();
+     retorno.Coberturas = new List<Cobertura>();
+     retorno.IsCepUnico = false;
+     retorno.HasCobertura = false;
+     retorno.HasDisponibilidade = false;
+     retorno.IsRoofTop = true;
+     retorno.ComplementoObrigatorio = false;
+
+     LocalidadeInfo cepResult = cep[0];
+
+     if (cepResult == null || (cepResult.error == null && cepResult.error == true))
+     {
+         _ = SaveDebugAsync($"O CEP {param.Cep} não foi encontrado. CEP nulo ou retorno da API como Error = True").ConfigureAwait(false);
+         return Ok(new
+         {
+             Error = true,
+             Message = $"O CEP {param.Cep} não foi encontrado.",
+             TempoExecucao = GetTempoExecucao(inicioExecucao),
+             Retorno = retorno
+         });
+     }
+
+     bool AuxCepUnico = false;
+
+     if (cepResult.cep_unico != null && cepResult.cep_unico == true)
+     {
+         retorno.IsCepUnico = true;
+         retorno.CEP = cepResult.cep;
+         retorno.UF = cepResult.sigla_uf;
+         retorno.Municipio = cepResult.nome_localidade;
+         AuxCepUnico = true;
+         retorno.IsRoofTop = false;
+         if (!enviouCoordenadas)
+         {
+             _ = SaveDebugAsync($"O CEP {param.Cep} é CEP único. Necessário especificar coordenadas.").ConfigureAwait(false);
+             return Ok(new
+             {
+                 Error = false,
+                 Message = "CEP único. Necessário especificar coordenadas.",
+                 TempoExecucao = GetTempoExecucao(inicioExecucao),
+                 Retorno = retorno
+             });
+         }
+     }
+
+     retorno.Numero = param.Numero;
+     retorno.CEP = param.Cep;
+     retorno.IsCepUnico = false;
+
+     List<ApiReqGeolocalizacaoResp> geo = new List<ApiReqGeolocalizacaoResp>();
+     ApiReqGeolocalizacaoResp geoCodificacao = new ApiReqGeolocalizacaoResp();
+
+     if (!enviouCoordenadas)
+     {
+         //validar Informacoes que vao ser chamadas de Outra API.Bairro, Logradouro, etc
+
+         if (string.IsNullOrEmpty(cepResult.sigla_uf))
+         {
+             _ = SaveDebugAsync($"Não foi possível obter a UF do CEP {param.Cep}. Objeto -> {Newtonsoft.Json.JsonConvert.SerializeObject(cepResult)}").ConfigureAwait(false);
+             return Ok(new
+             {
+                 Error = true,
+                 Message = $"Não foi possível obter a UF do CEP {param.Cep}.",
+                 TempoExecucao = GetTempoExecucao(inicioExecucao),
+                 Retorno = retorno
+             });
+         }
+
+         if (string.IsNullOrEmpty(cepResult.nome_localidade))
+         {
+             _ = SaveDebugAsync($"Não foi possível obter o nome da Cidade do CEP {param.Cep}. Objeto -> {Newtonsoft.Json.JsonConvert.SerializeObject(cepResult)}").ConfigureAwait(false);
+             return Ok(new
+             {
+                 Error = true,
+                 Message = $"Não foi possível obter o nome da Cidade do CEP {param.Cep}.",
+                 TempoExecucao = GetTempoExecucao(inicioExecucao),
+                 Retorno = retorno
+             });
+         }
+
+
+         geo = await Task.Run(() => ConsultaGeolocalizacao(new Param { Cep = param.Cep, Numero = param.Numero }));
+
+         if (geo == null ||
+             geo.Count == 0 ||
+             (geo.FindAll(f => (f.error != null && f.error == true)).ToList()).Count > 0)
+         {
+             _ = SaveDebugAsync($"Não foi possível obter as coordenadas do CEP  {param.Cep} e do número {param.Numero}. Objeto -> {Newtonsoft.Json.JsonConvert.SerializeObject(geo)}").ConfigureAwait(false);
+             return Ok(new
+             {
+                 Error = true,
+                 Message = $"Não foi possível obter as coordenadas do CEP {param.Cep} e do número {param.Numero}.",
+                 TempoExecucao = GetTempoExecucao(inicioExecucao),
+                 Retorno = retorno
+             });
+         }
+         geoCodificacao = geo[0];
+
+         //Salva o JSON da consulta
+         logJSON.JsonGeocode = JsonConvert.SerializeObject(geo);
+
+         if (geoCodificacao.location_type.ToString().ToUpper() != "ROOFTOP" && (geoCodificacao.y == 0 || AuxCepUnico))
+         {
+             retorno.CoordenadaXY = geoCodificacao.Coordenada;
+             retorno.IsRoofTop = false;
+
+             _ = SaveDebugAsync($"Não é um geocódigo preciso, necessário especificar as coordenadas. Objeto -> {Newtonsoft.Json.JsonConvert.SerializeObject(geoCodificacao)}").ConfigureAwait(false);
+
+             return Ok(new
+             {
+                 Error = false,
+                 Message = "Não é um geocódigo preciso, necessário especificar as coordenadas.",
+                 TempoExecucao = GetTempoExecucao(inicioExecucao),
+                 Retorno = retorno
+             });
+         }
+
+         //geoCodificacao.endereco_completo;
+         //Av.Engenheiro Luís Carlos Berrini, 1376 - Cidade Monções, São Paulo -SP, 04576 - 100, Brasil
+
+         //Endereço Fix Letras
+         retorno.EnderecoCompleto = ConstruirEnderecoCompleto(param, geoCodificacao, cepResult);
+
+         retorno.CoordenadaXY = geoCodificacao.Coordenada;
+         //retorno.Municipio = geoCodificacao.municipio;
+         retorno.IdViabilidadeTipo = (byte)ViabilidadeTipo.Indefinido;
+     }
+
+
+     string uf = cepResult.sigla_uf.ToUpper();
+     string nomeMunicipio = cepResult.nome_localidade;
+
+     var objMunicipio = _simulacaoRepository.GetMunicipio(nomeMunicipio, uf).FirstOrDefault();
+
+     if (objMunicipio == null)
+     {
+         _ = SaveDebugAsync($"Não foi possível obter o Id do Município {nomeMunicipio} da UF {uf}. Não houve resultados. Objeto -> {Newtonsoft.Json.JsonConvert.SerializeObject(objMunicipio)}").ConfigureAwait(false);
+
+         return Ok(new
+         {
+             Error = true,
+             Message = $"Não foi possível obter o Id do Município {nomeMunicipio} da UF {uf}. Não houve resultados.",
+             TempoExecucao = GetTempoExecucao(inicioExecucao),
+             Retorno = retorno
+         });
+     }
+
+     retorno.IdMunicipio = objMunicipio.IdMunicipio;
+     retorno.Municipio = nomeMunicipio;// param.Municipio;
+     retorno.UF = uf;// param.Municipio;
+
+
+     if (enviouCoordenadas)
+     {
+         string[] arr = param.Coordenada.Split(",");
+         geoCodificacao.x = Convert.ToDouble(arr[1], CultureInfo.InvariantCulture);   //Lat
+         geoCodificacao.y = Convert.ToDouble(arr[0], CultureInfo.InvariantCulture);  //Long
+         geoCodificacao.Coordenada = geoCodificacao.x.ToString(CultureInfo.InvariantCulture) + "," + geoCodificacao.y.ToString(CultureInfo.InvariantCulture);
+         //R. São José, 58 - Ouro Preto, MG, 35400000
+
+         geoCodificacao.logradouro = param.Logradouro.ToUpper().RemoverAcento();
+         geoCodificacao.numero = param.Numero;
+         geoCodificacao.bairro = param.Bairro.ToUpper().RemoverAcento().Length == 0 ? "Centro" : param.Bairro.ToUpper().RemoverAcento();
+         geoCodificacao.municipio = nomeMunicipio.ToUpper().RemoverAcento();
+         geoCodificacao.uf = uf.ToUpper();
+
+         //Subscreve com os parametros do Front(mapa)
+         //retorno.EnderecoCompleto = "R. São José, 58 - Ouro Preto, MG, 35400-000";// param.EnderecoCompleto;
+         retorno.CoordenadaXY = param.Coordenada;
+         retorno.IdViabilidadeTipo = (byte)ViabilidadeTipo.Indefinido;
+         retorno.Logradouro = geoCodificacao.logradouro;
+         retorno.LogradouroTipo = param.TipoLogradouro.ToUpper().RemoverAcento();
+         cepResult.tipo_logradouro = cepResult.tipo_logradouro ?? param.TipoLogradouro;
+         retorno.IsRoofTop = true;
+     }
+
+     //Regra do DexPara
+     MunicipioPrioAux municipioPrio = new MunicipioPrioAux();
+
+     string critica = string.Empty;
+
+     //Pega endereco tecnico
+     /*
+      * 
+      *  -------------- BLOCO ENDERECO TECNICO E DISPONIBILIDADE 
+      *  
+      */
+
+     retorno.Logradouro = (string.IsNullOrEmpty(cepResult.nome_logradouro) ? geoCodificacao.logradouro : cepResult.nome_logradouro);
+     string LogradouroAux = (string.IsNullOrEmpty(cepResult.nome_logradouro) ? geoCodificacao.logradouro : cepResult.nome_logradouro).ToUpper().RemoverAcento();
+     //Tenta corrigir o endereço do Google tipo_logradouro + Logradouro
+     if (!string.IsNullOrEmpty(cepResult.tipo_logradouro))
+     {
+         retorno.LogradouroTipo = cepResult.tipo_logradouro.ToPascalCase();
+         retorno.Logradouro = GetAux.CorrigeLogradouro((string.IsNullOrEmpty(cepResult.nome_logradouro) ? geoCodificacao.logradouro : cepResult.nome_logradouro), cepResult.tipo_logradouro).ToPascalCase();
+         LogradouroAux = retorno.Logradouro.ToUpper().RemoverAcento();
+     }
+     municipioPrio.IdMunicipio = objMunicipio.IdMunicipio;
+     bool hasInventario = false;
+
+     //VERIFICA SE FRONT ENVIOU INFO DISPONIBILIDADE
+     bool enviouDisponibilidade = false;
+     if (param.DisponibilidadeSelect != null && param.EnderecoInventarioSelect != null)
+     {
+         enviouDisponibilidade = (param.DisponibilidadeSelect.IdTecnologia != 0 &&
+                                 !string.IsNullOrEmpty(param.DisponibilidadeSelect.DescTecnologia) &&
+                                 !string.IsNullOrEmpty(param.EnderecoInventarioSelect.streetCode) &&
+                                 !string.IsNullOrEmpty(param.EnderecoInventarioSelect.tecnologia)
+                                 );
+     }
+
+     if (!enviouDisponibilidade)
+     {
+         List<ListaComplemento> _Complemento = ValidaComplemento(param, retorno);
+
+         string JsonBody = JsonConvert.SerializeObject(new inputEnderecoTecnico
+         {
+             cep = new Cep
+             {
+                 cep = param.Cep,
+                 numero = param.Numero
+             },
+             endereco = new Endereco
+             {
+                 logradouro = LogradouroAux,
+                 numero = param.Numero,
+                 bairro = (string.IsNullOrEmpty(cepResult.bairro_inicial) ? geoCodificacao.bairro : cepResult.bairro_inicial).ToUpper().RemoverAcento(),
+                 municipio = (string.IsNullOrEmpty(cepResult.nome_localidade) ? geoCodificacao.municipio : cepResult.nome_localidade).ToUpper().RemoverAcento(),
+                 uf = cepResult.sigla_uf.ToUpper(),
+                 complemento = _Complemento
+             },
+             Coordenadas = new List<Coordenada>{
+             new Coordenada { Latitude = geoCodificacao.x.ToString(), Longitude = geoCodificacao.y.ToString() }
+         }
+         });
+
+         var techAddress = await Task.Run(() => ConsultaInvetario(new inputEnderecoTecnico(), JsonBody));
+
+         if (techAddress != null && (techAddress.FindAll(f => f.error == null || f.error == false).Count > 0))
+         {
+             //Salva o JSON da consulta
+             logJSON.JsonInventario = JsonConvert.SerializeObject(techAddress);
+
+             var listFinal = await Task.Run(() => AgrupaInvetario(techAddress, nomeMunicipio, uf));
+
+             // Encontra todas as áreas telefônicas não vazias no conjunto de dados techAddress,
+             // converte-as para maiúsculas e remove duplicatas, criando uma lista de áreas telefônicas distintas.
+             var distincttelephonicArea = techAddress.FindAll(
+                 f => !string.IsNullOrEmpty(f.telephonicArea))
+                 .Select(ga => ga.telephonicArea.ToUpper()).Distinct().ToList();
+
+             // Encontra todos os proprietários de rede não vazios no conjunto de dados techAddress,
+             // converte-os para maiúsculas e remove duplicatas, criando uma lista de proprietários de rede distintos.
+             var distinctNetworkOwners = techAddress.FindAll(
+                 f => !string.IsNullOrEmpty(f.networkOwner))
+                 .Select(ga => ga.networkOwner.ToUpper()).Distinct().ToList();
+
+             SiebelMunicipio = techAddress.FindAll(f => !string.IsNullOrEmpty(f.municipio)).Select(ga => ga.municipio.ToUpper()).Distinct().FirstOrDefault();
+
+             municipioPrio.TemVivo1 = Convert.ToBoolean(distinctNetworkOwners.Where(value => value.StartsWith("VIVO1")).Count());
+             municipioPrio.TemVivo2 = Convert.ToBoolean(distinctNetworkOwners.Where(value => value.StartsWith("VIVO2")).Count());
+             municipioPrio.TemFibrasil = Convert.ToBoolean(distincttelephonicArea.Where(value => value.StartsWith("FIBRASIL")).Count());
+             municipioPrio.TemATC = Convert.ToBoolean(distincttelephonicArea.Where(value => value.StartsWith("ATC")).Count());
+
+             if (listFinal != null && listFinal.Count > 0)
+             {
+                 //VERIFICA SE PRECISA RETORNAR INVENTARIO
+                 var listafiltro = (from x in listFinal
+                                    group x by new { x.telephonicArea, x.idTecnologia, x.networkOwner } into a
+                                    select new
+                                    {
+                                        a.Key.idTecnologia,
+                                        a.Key.networkOwner,
+                                        a.Key.telephonicArea,
+                                        QtdEndereco = listFinal.Where(e => e.idTecnologia == a.Key.idTecnologia &&
+                                                                     e.networkOwner == a.Key.networkOwner &&
+                                                                     e.telephonicArea == a.Key.telephonicArea
+                                                                     ).Select(s => new { s.logradouro, s.streetCode, complemento = (s.aliasedGeographicAddressComplement != null && s.aliasedGeographicAddressComplement.Count > 0 ? s.aliasedGeographicAddressComplement[0]?.Value : "") }).Distinct().Count()
+                                    }).ToList();
+
+
+                 //COLOCAR IF DE CIDADE
+                 if (listafiltro.Where(x => x.QtdEndereco > 1).Count() > 0)
+                 {
+                     retorno.Inventario = listFinal;
+                     retorno.IsRetornoInventario = true;
+                     return Ok(new
+                     {
+                         Error = false,
+                         Message = "Inventário. Necessário especificar endereço tecnico.",
+                         TempoExecucao = GetTempoExecucao(inicioExecucao),
+                         Retorno = retorno
+                     });
+                 }
+             }
+
+             //DISPONIBILIDADE
+             bool IsApiDisponibilidadeOK = true;
+
+             Ambiente ambiente = (Ambiente)Convert.ToInt32(_config["Telefonica:IsProducao"]);
+             if (string.IsNullOrEmpty(PublicConstants.TokenVivoOAuth) || DateTime.Now >= PublicConstants.TokenVivoOAuthValidade)
+             {
+                 string respToken = await GerenciamentoAPIUtil.RefreshTokenAsync(ApiToken.VivoOAuthService, ambiente, _config).ConfigureAwait(false);
+
+                 if (!string.IsNullOrEmpty(respToken))
+                 {
+                     _ = SaveDebugAsync($"Não foi possível obter o Token de Disponibilidade (Telefonica). " +
+                  $"Retorno :{respToken} - " +
+                  $"Ambiente:{ambiente.GetDisplayName}").ConfigureAwait(false);
+
+                     IsApiDisponibilidadeOK = false;
+                     return BadRequest(new { Error = true, Retorno = respToken });
+                 }
+             };
+
+             if (IsApiDisponibilidadeOK && listFinal.Count > 0)
+             {
+                 bool temViabilidade = false;
+                 //marca q tem disponibilidade
+                 hasInventario = true;
+                 retorno.HasDisponibilidade = true;
+
+
+                 for (int i = 0; i < listFinal.FindAll(f => f.idTecnologia == (int)Tecnologia.GPON).Count(); i++)
+                 {
+
+                     string networkOwner = listFinal[i].networkOwner;
+                     string mediaType = BuildMediaType(networkOwner, listFinal[i].telephonicArea, listFinal[i].tecnologia);
+                     string telephonicArea = BuildArea(listFinal[i].telephonicArea);
+                     string logradouro = listFinal[i].logradouro;
+                     string tipoLogradouro = listFinal[i].tipoLogradouro;
+                     JsonBody = ConstroiJsonDisponibilidade(listFinal, i, networkOwner, mediaType, telephonicArea);
+
+                     var disponibilidade = await Task.Run(() => ConsultaDisponibilidade(JsonBody)).ConfigureAwait(false);
+
+                     //Regras que populam a lista
+                     ConstroiDisponibilidade(ref retorno, ref critica, disponibilidade, networkOwner, cepResult, logradouro, tipoLogradouro, listFinal[i].tecnologia);
+
+
+                     //Salva o JSON da consulta
+                     if (disponibilidade != null) { logJSON.JsonDisponibilidade += $"||{JsonConvert.SerializeObject(disponibilidade)}||"; }
+
+
+                     if (retorno.Disponibilidades != null)
+                     {
+
+                         foreach (var item in retorno.Disponibilidades.FindAll(
+                             f => f.IdTecnologia == (int)Tecnologia.GPON))
+                         {
+                             SalvaDisponibilidade(listFinal, i, mediaType, telephonicArea, item);
+                         }
+
+                         //PARA O LOOP POIS JÁ ENCONTROU GPON COM DISPONIBILIDADE. 
+                         bool TemGPONcomPortaDisponivel = (bool)(retorno.Disponibilidades?.Any(d => d.IdTecnologia == (int)Tecnologia.GPON &&
+                         d.hasViabilidade));
+
+                         if (TemGPONcomPortaDisponivel)
+                         {
+                             temViabilidade = true;
+                             break;
+                         }
+                     }
+                 }
+
+
+                 if (!temViabilidade)
+                 {
+                     List<EnderecoTecnicoAgrupado> lstMetalico = new List<EnderecoTecnicoAgrupado>();
+
+                     lstMetalico = listFinal.FindAll(f => f.idTecnologia == (int)Tecnologia.Metalico);
+                     bool TemMETALICOcomPortaDisponivel = false;
+
+                     for (int i = 0; i < lstMetalico.Count(); i++)
+                     {
+                         string networkOwner = lstMetalico[i].networkOwner;
+                         string mediaType = BuildMediaType(networkOwner, lstMetalico[i].telephonicArea, lstMetalico[i].tecnologia);
+                         string telephonicArea = BuildArea(lstMetalico[i].telephonicArea);
+                         string logradouro = lstMetalico[i].logradouro;
+                         string tipoLogradouro = lstMetalico[i].tipoLogradouro;
+                         JsonBody = ConstroiJsonDisponibilidade(lstMetalico, i, networkOwner, mediaType, telephonicArea);
+
+                         var disponibilidade = await Task.Run(() => ConsultaDisponibilidade(JsonBody)).ConfigureAwait(false);
+
+                         //Regras que populam a lista
+                         ConstroiDisponibilidade(ref retorno, ref critica, disponibilidade, networkOwner, cepResult, logradouro, tipoLogradouro, lstMetalico[i].tecnologia);
+
+                         //Salva o JSON da consulta
+                         if (disponibilidade != null)
+                         {
+                             logJSON.JsonDisponibilidade += $"||{JsonConvert.SerializeObject(disponibilidade)}||";
+                         }
+
+                         if (retorno.Disponibilidades != null)
+                         {
+                             foreach (var item in retorno.Disponibilidades.FindAll(
+                                 f => f.IdTecnologia == (int)Tecnologia.Metalico))
+                             {
+                                 SalvaDisponibilidade(listFinal, i, mediaType, telephonicArea, item);
+                             }
+
+                             TemMETALICOcomPortaDisponivel = (bool)(retorno.Disponibilidades?.Any(d => d.IdTecnologia == (int)Tecnologia.Metalico &&
+                             d.hasViabilidade));
+
+                             //PARA O LOOP POIS JÁ ENCONTROU METALICO COM DISPONIBILIDADE. 
+                             if (TemMETALICOcomPortaDisponivel)
+                             {
+                                 retorno.Disponibilidades.RemoveAll(d => d.IdTecnologia == (int)Tecnologia.Metalico && Convert.ToInt32(d.QtdeArmario) == 0);
+                                 break;
+                             }
+                         }
+                     }
+
+                 }
+
+             }
+         }
+
+     }
+     else
+     {
+         //ENVIOU DADOS DISPONIBILIDADE
+         //FICOU UMA MERDA ISSO AQUI E NAO TENHO CULPA
+
+         //marca q tem disponibilidade
+         hasInventario = true;
+         retorno.HasDisponibilidade = true;
+         retorno.IsRetornoInventario = false;
+
+         string networkOwner = param.EnderecoInventarioSelect.networkOwner;
+         string mediaType = BuildMediaType(networkOwner, param.EnderecoInventarioSelect.telephonicArea, param.EnderecoInventarioSelect.tecnologia);
+         string telephonicArea = BuildArea(param.EnderecoInventarioSelect.telephonicArea);
+
+         municipioPrio.TemVivo1 = networkOwner.StartsWith("VIVO1");
+         municipioPrio.TemVivo2 = networkOwner.StartsWith("VIVO2");
+         municipioPrio.TemFibrasil = networkOwner.StartsWith("FIBRASIL");
+         municipioPrio.TemATC = networkOwner.StartsWith("ATC");
+
+         //Cobertura
+         retorno.HasCobertura = true;
+         Cobertura objCobertura = new Cobertura();
+         objCobertura.Rede = param.DisponibilidadeSelect.Rede;
+         objCobertura.IdTecnologia = param.DisponibilidadeSelect.IdTecnologia;
+         objCobertura.DescTecnologia = param.DisponibilidadeSelect.DescTecnologia;
+         objCobertura.DescricaoCompleta = param.DisponibilidadeSelect.DescricaoCompleta;
+         objCobertura.Indice = retorno.Coberturas.Count();
+
+         retorno.Coberturas.Add(objCobertura);
+
+         //Salva Disponibilidade
+         DisponibilidadeLog vc = new DisponibilidadeLog();
+         vc.Cnl = param.EnderecoInventarioSelect.cnl;
+         vc.CnlAcronym = param.EnderecoInventarioSelect.cnlAcronym;
+         vc.Origem = param.EnderecoInventarioSelect.origem;
+         vc.StreetCode = param.EnderecoInventarioSelect.streetCode;
+         vc.StreetNrFirst = param.EnderecoInventarioSelect.numero;
+         vc.NetworkOwner = param.EnderecoInventarioSelect.networkOwner;
+         vc.TelephonicArea = param.EnderecoInventarioSelect.telephonicArea;
+         vc.MediaType = mediaType;
+         vc.Rede = param.DisponibilidadeSelect.Rede;
+         vc.IdTecnologia = param.DisponibilidadeSelect.IdTecnologia;
+         vc.DescTecnologia = param.DisponibilidadeSelect.DescTecnologia;
+         vc.DescricaoCompleta = param.DisponibilidadeSelect.DescricaoCompleta;
+         vc.QtdeArmario = param.DisponibilidadeSelect.QtdeArmario;
+         vc.QtdeLinhaTelefonica = param.DisponibilidadeSelect.QtdeLinhaTelefonica;
+         vc.TecnologiaDeAcesso = param.DisponibilidadeSelect.TecnologiaDeAcesso;
+         vc.VelocidadeMaximaDisponivel = param.DisponibilidadeSelect.VelocidadeMaximaDisponivel;
+         vc.Critica = param.DisponibilidadeSelect.Critica;
+         vc.Logradouro = param.EnderecoInventarioSelect.logradouro;
+         vc.Municipio = param.EnderecoInventarioSelect.municipio;
+         long IdDisponibilidade = _viabilidadeRepository.PutDisponibilidade(vc);
+         param.DisponibilidadeSelect.IdDisponibilidade = IdDisponibilidade;
+
+         retorno.IdViabilidadeTipo = (byte)ViabilidadeTipo.Disponibilidade;
+         retorno.Disponibilidades.Add(param.DisponibilidadeSelect);
+
+     }
+
+
+     /******************* COBERTURA / MANCHA *********************************/
+
+     #region COBERTURA
+     if (!retorno.HasDisponibilidade)
+     {
+         var DexParaCobertura = _produtoRepository.GetCoberturaTecnologia();
+
+         var mancha = await Task.Run(() => ConsultaCobertura(new Param
+         {
+             Coordenada = geoCodificacao.Coordenada,
+             IdFamilia = param.IdFamilia
+         }));
+
+         RootCobertura lstcobertura = mancha.error == null || mancha.error == false ? mancha : null;
+
+         if (lstcobertura != null)
+         {
+             logJSON.JsonCobertura = JsonConvert.SerializeObject(lstcobertura);
+
+             bool TemGPON = false;
+             bool TemMetalico = false;
+
+             //Verifica Rede
+             DexParaCobertura.ToList().ForEach(x =>
+             {
+                 //Verifica se tecnologia existe
+                 var _possuiViab = lstcobertura.GetType().GetProperty(x.RetornoViabilidade).GetValue(lstcobertura);
+                 x.PossuiViabilidade = Convert.ToBoolean(_possuiViab);
+             });
+
+             var redeGPON = DexParaCobertura.Where(w => w.Tecnologia.ToUpper() == "GPON" && w.PossuiViabilidade).FirstOrDefault();
+             if (redeGPON != null)
+             {
+                 critica = "Venda na mancha";
+                 TemGPON = true;
+                 Cobertura objCobertura = new Cobertura();
+                 retorno.HasCobertura = true;
+                 objCobertura.IdTecnologia = (int)Tecnologia.GPON;
+                 objCobertura.DescTecnologia = GetDescricaoTipoTecnologia(objCobertura.IdTecnologia);
+                 objCobertura.Critica = critica;
+                 objCobertura.Rede = redeGPON.Rede.Trim();
+                 objCobertura.DescricaoCompleta = $"{redeGPON.Rede} {objCobertura.DescTecnologia}";
+                 objCobertura.Indice = retorno.Coberturas.Count();
+                 retorno.Coberturas.Add(objCobertura);
+                 retorno.IdViabilidadeTipo = (byte)ViabilidadeTipo.Cobertura;
+
+                 //Cria uma disponibilidade
+                 //Penna
+                 //retorno.Disponibilidades.Add(new Disponibilidade()
+                 //{
+                 //    Indice = 1,
+                 //    IdTecnologia = 1,
+                 //    DescTecnologia = GetDescricaoTipoTecnologia(objCobertura.IdTecnologia),
+                 //    DescricaoCompleta = $"{redeGPON.Rede} {objCobertura.DescTecnologia}",
+                 //    Rede = redeGPON.Rede,
+                 //    Critica = critica
+                 //});
+             }
+
+             if (!TemGPON)
+             {
+                 var redeMETALICO = DexParaCobertura.Where(w => w.Tecnologia.ToUpper() == "METALICO" && w.PossuiViabilidade).FirstOrDefault();
+
+                 if (redeMETALICO != null)
+                 {
+                     TemMetalico = true;
+                     Cobertura objCobertura = new Cobertura();
+                     retorno.HasCobertura = true;
+                     objCobertura.IdTecnologia = (int)Tecnologia.Metalico;
+                     objCobertura.DescTecnologia = GetDescricaoTipoTecnologia(objCobertura.IdTecnologia);
+                     objCobertura.Critica = critica;
+                     objCobertura.Rede = redeMETALICO == null ? "N/A" : redeMETALICO?.Rede;
+                     objCobertura.DescricaoCompleta = $"{(redeMETALICO == null ? "N/A" : redeMETALICO?.Rede)} {objCobertura.DescTecnologia}";
+                     objCobertura.Indice = retorno.Coberturas.Count();
+                     retorno.Coberturas.Add(objCobertura);
+                     retorno.IdViabilidadeTipo = (byte)ViabilidadeTipo.Cobertura;
+                 }
+
+             }
+         }
+     }
+
+     #endregion
+
+
+     //MunicipioPrioRegraViewModel
+     if (enviouCoordenadas) { cepResult.bairro_inicial = ((param.Bairro != "" && param.Bairro != null) ? param.Bairro : cepResult.bairro_inicial); }
+
+
+     if (retorno.HasDisponibilidade)
+     {
+         //Contagem de disponibilidade GPON
+         municipioPrio.TemGPON = Convert.ToBoolean(retorno.Disponibilidades.Where(
+             value => value.IdTecnologia == (int)Tecnologia.GPON).Count());
+
+         //Contagem de disponibilidade METALICO
+         municipioPrio.TemMetalico = Convert.ToBoolean(retorno.Disponibilidades.Where(
+             value => value.IdTecnologia == (int)Tecnologia.Metalico).Count());
+     }
+     else if (retorno.HasCobertura)
+     {
+         //Contagem de disponibilidade GPON
+         municipioPrio.TemGPON = Convert.ToBoolean(retorno.Coberturas.Where(
+                value => value.IdTecnologia == (int)Tecnologia.GPON).Count());
+
+         //REGRA: SE TEM GPON, IGNORAR VENDA DE METALICO.
+         if (!municipioPrio.TemGPON)
+         {
+             //Contagem de disponibilidade METALICO
+             municipioPrio.TemMetalico = Convert.ToBoolean(retorno.Coberturas.Where(
+                 value => value.IdTecnologia == (int)Tecnologia.Metalico).Count());
+         }
+     }
+
+
+     //Apenas quando não houver Disponibilidade, e vamos para nivel de cobertura(mancha)
+     if (!retorno.HasDisponibilidade && retorno.HasCobertura)
+     {
+         // Encontra todos os proprietários de rede não vazios no conjunto de dados techAddress,
+         // converte-os para maiúsculas e remove duplicatas, criando uma lista de proprietários de rede distintos.
+         var distinctNetworkOwners = retorno.Coberturas.FindAll(
+             f => !string.IsNullOrEmpty(f.Rede))
+             .Select(ga => ga.Rede.ToUpper()).Distinct().ToList();
+
+         municipioPrio.TemVivo1 = Convert.ToBoolean(distinctNetworkOwners.Where(value => value.StartsWith("VIVO1")).Count());
+         municipioPrio.TemVivo2 = Convert.ToBoolean(distinctNetworkOwners.Where(value => value.StartsWith("VIVO2")).Count());
+         municipioPrio.TemFibrasil = Convert.ToBoolean(distinctNetworkOwners.Where(value => value.StartsWith("FIBRASIL")).Count());
+         municipioPrio.TemATC = Convert.ToBoolean(distinctNetworkOwners.Where(value => value.StartsWith("ATC")).Count());
+     }
+
+     var DexParaRetorno = _produtoRepository.GetMunicipioPrioRegra(municipioPrio);
+
+     if (retorno.HasDisponibilidade)
+     {
+         foreach (var item in DexParaRetorno)
+         {
+             //Se encontrar os cenário compativeis, marca como visivel
+             for (int i = 0; i < retorno.Disponibilidades.Count; i++)
+             {
+                 if (retorno.Disponibilidades[i].IdTecnologia == item.IdTecnologia &&
+                     retorno.Disponibilidades[i].Rede == item.Rede)
+                 {
+                     retorno.Disponibilidades[i].IsVisible = true;
+                 }
+             }
+         }
+
+         //REMOVE O QUE NAO FOR PRA MOSTRAR DE ACORDO COM A REGRA COMERCIAL
+         retorno.Disponibilidades.RemoveAll(disponibilidade => !disponibilidade.IsVisible);
+
+     }
+     else if (retorno.HasCobertura)
+     {
+         //ORDENA POR TECNOLOGIA, ASSIM COMEÇA PRIMEIRO PELO GPON QUE É O ID 1.
+         foreach (var item in DexParaRetorno.OrderBy(X => X.IdTecnologia))
+         {
+             //Se encontrar os cenário compativeis, marca como visivel
+             for (int i = 0; i < retorno.Coberturas.Count; i++)
+             {
+                 if (retorno.Coberturas[i].IdTecnologia == item.IdTecnologia &&
+                     retorno.Coberturas[i].Rede == item.Rede)
+                 {
+                     retorno.Coberturas[i].IsVisible = true;
+                 }
+             }
+         }
+
+         //REMOVE O QUE NAO FOR PRA MOSTRAR DE ACORDO COM A REGRA COMERCIAL
+
+         //SE TEM GPON, REMOVER METALICO
+         if (retorno.Coberturas.FindAll(f => f.IdTecnologia == (int)Tecnologia.GPON).Count > 0)
+         {
+             retorno.Coberturas.FindAll(f => f.IdTecnologia != (int)Tecnologia.GPON).ForEach(f => f.IsVisible = false);
+         }
+
+         retorno.Coberturas.RemoveAll(cobertura => !cobertura.IsVisible);
+
+         //FIX TEMPORARIO
+         //QUANDO NAO HOUVER DISPONIBILIDADE E SÓ COBERTRA (OBJETO SERÁ DESCONTINUADO). SERÁ CRIADO UM OBJECTO DE DISPONIBILIDADE FAKE COM O CONTEUDO
+         //DE DO OBJETO COBERTURA.
+
+         //  SalvaDisponibilidade(lst, i, mediaType, telephonicArea, item);
+
+         DisponibilidadeLog vc = new DisponibilidadeLog();
+         vc.Cnl = string.Empty;
+         vc.CnlAcronym = string.Empty;
+         vc.Origem = string.Empty;
+         vc.StreetCode = string.Empty;
+         vc.StreetNrFirst = string.Empty;
+         vc.NetworkOwner = string.Empty;
+         vc.TelephonicArea = string.Empty;
+         vc.MediaType = string.Empty;
+         vc.Rede = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].Rede : "N/A";
+         vc.IdTecnologia = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].IdTecnologia : 0;
+         vc.DescTecnologia = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].DescTecnologia : "N/A";
+         vc.DescricaoCompleta = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].DescricaoCompleta : "N/A";
+         vc.QtdeArmario = string.Empty;
+         vc.QtdeLinhaTelefonica = string.Empty;
+         vc.TecnologiaDeAcesso = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].DescTecnologia : "N/A";
+         vc.VelocidadeMaximaDisponivel = string.Empty;
+         vc.Logradouro = retorno.Logradouro;
+         vc.Municipio = retorno.Municipio;
+         vc.Critica = "Venda na mancha";
+
+         // SalvaDisponibilidade(lst, i, mediaType, telephonicArea, item);
+
+         //logDetalhe.Add(vc);
+         long IdDisponibilidade = _viabilidadeRepository.PutDisponibilidade(vc);
+
+
+         Disponibilidade fakeDisp = new Disponibilidade
+         {
+             IsVisible = true,
+             Indice = 1,
+             IdDisponibilidade = IdDisponibilidade,
+             IdTecnologia = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].IdTecnologia : 0,
+             DescTecnologia = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].DescTecnologia : "N/A",
+             DescricaoCompleta = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].DescricaoCompleta : "N/A",
+             Rede = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].Rede : "N/A",
+             QtdeArmario = string.Empty,
+             QtdeLinhaTelefonica = string.Empty,
+             TecnologiaDeAcesso = retorno.Coberturas.Count > 0 ? retorno.Coberturas[0].DescTecnologia : "N/A",
+             VelocidadeMaximaDisponivel = string.Empty,
+             Critica = "Venda na mancha.",
+             DisponibilidadeDetalhes = new List<DisponibilidadeDetalhe>
+             {
+                 new DisponibilidadeDetalhe { Indice = 1, DescTecnologia = string.Empty, QtdePortaLivre = string.Empty}
+              }
+         };
+
+         //Converte cobertura em disponibilidade
+         retorno.Disponibilidades.Add(fakeDisp);
+     }
+
+
+     retorno.Bairro = cepResult.bairro_inicial.ToPascalCase();   //PUXA DA API DE CEP
+     retorno.Municipio = cepResult.nome_localidade.ToPascalCase();  //PUXA DA API DE CEP
+
+     logConsulta.CEP = param.Cep;
+     logConsulta.Numero = param.Numero;
+     logConsulta.IpUsuario = IpUsuario;
+
+     logConsulta.Logradouro = retorno.Logradouro.ToPascalCase();
+     logConsulta.Bairro = retorno.Bairro.ToPascalCase();
+     logConsulta.IdMunicipio = retorno.IdMunicipio;
+
+     //ALTERADO POR CAUSA DO INPUT SIEBEL, se nao tiver retorna no inventário, usa o retorno padrao, CEP.
+     logConsulta.Municipio = SiebelMunicipio.Length > 0 ? SiebelMunicipio : retorno.Municipio;
+     logConsulta.TipoLogradouro = retorno.LogradouroTipo;
+     logConsulta.Complemento1 = retorno.Complemento1;
+     logConsulta.Complemento2 = retorno.Complemento2;
+     logConsulta.Complemento3 = retorno.Complemento3;
+
+
+     logConsulta.UF = retorno.UF;
+     logConsulta.Coordenadas = retorno.CoordenadaXY;
+     logConsulta.Latitude_X = Convert.ToDecimal(geoCodificacao.x);
+     logConsulta.Longitude_Y = Convert.ToDecimal(geoCodificacao.y);
+     logConsulta.LocationType = geoCodificacao.location_type;
+     logConsulta.IdUsuario = IdUsuario;
+     logConsulta.IdViabilidadeTipo = retorno.IdViabilidadeTipo;
+     logConsulta.TempoExecucao = GetTempoExecucao(inicioExecucao);
+
+     //Cria o Log da consulta
+     
+
+     try
+     {
+         retorno.IdConsulta = _viabilidadeRepository.PutViabilidadeConsulta(logConsulta);
+     }
+     catch (Exception ex)
+     {
+         
+         Console.WriteLine($"Erro ao executar PutViabilidadeConsulta: {ex.Message}");
+
+         // Definir um valor padrão ou outro comportamento em caso de erro
+         retorno.IdConsulta = -1; // Valor padrão indicando erro (ajuste conforme necessário)
+
+         
+     }
+
+
+     //Atualiza Log de Disponibilidade
+
+     retorno.Disponibilidades.ForEach(f =>
+     _viabilidadeRepository.PatchDisponibilidade(retorno.IdConsulta, f.IdDisponibilidade));
+
+     //Tira necessidade de mapa e Cep Unico
+     retorno.IsRoofTop = true;
+
+     //Salvar JSON como LOG
+     logJSON.IdViabilidadeConsulta = retorno.IdConsulta;
+     _simulacaoRepository.PutCEP(retorno.CEP, false);
+     _simulacaoRepository.PutBairro(retorno.Bairro);
+     _simulacaoRepository.PutLogradouro(retorno.Logradouro);
+     _viabilidadeRepository.PutViabilidadeJson(logJSON);
+
+
+     return Ok(new
+     {
+         Error = false,
+         Message = string.Empty,
+         TempoExecucao = GetTempoExecucao(inicioExecucao),
+         Retorno = retorno
+         // Debug = lstDebug
+     });
+ }
