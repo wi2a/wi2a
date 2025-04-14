@@ -1,0 +1,285 @@
+// Estrutura inicial do controller
+[Route("ConsultaCompleta")]
+[HttpPost]
+public async Task<ActionResult> ConsultaCompleta([FromBody] Param param)
+{
+    System.DateTime inicioExecucao = System.DateTime.Now;
+    int IdUsuario = Convert.ToInt32(User.FindFirst(ClaimTypes.NameIdentifier)?.Value);
+    string IpUsuario = "0";
+
+    var retorno = new ViabilidadeEndereco();
+    var logConsulta = new ViabilidadeConsulta();
+    var logJSON = new ViabilidadeJson();
+
+    var valida = await ValidaParametros(param, inicioExecucao, retorno);
+    if (valida != null) return valida;
+
+    var tokenValido = await VerificaTokenCobertura(_config);
+    if (!tokenValido.Sucesso)
+        return Ok(GerarRetornoErro(tokenValido.Mensagem, inicioExecucao, retorno));
+
+    var cepResult = await ObterCep(param, logJSON);
+    if (cepResult == null) return Ok(GerarRetornoErro("CEP não encontrado.", inicioExecucao, retorno));
+
+    var geoCodificacao = await ObterGeolocalizacao(param, cepResult, logJSON);
+    if (geoCodificacao == null) return Ok(GerarRetornoErro("Geolocalização falhou.", inicioExecucao, retorno));
+
+    var objMunicipio = ObterMunicipio(_simulacaoRepository, cepResult);
+    if (objMunicipio == null) return Ok(GerarRetornoErro("Município não encontrado.", inicioExecucao, retorno));
+
+    AjustaRetornoEndereco(param, cepResult, geoCodificacao, objMunicipio, retorno);
+
+    var inventarioOK = await ProcessarInventarioDisponibilidade(param, cepResult, geoCodificacao, retorno, logJSON, _config);
+
+    if (!retorno.HasDisponibilidade)
+        await VerificaCoberturaFallback(param, retorno, geoCodificacao, logJSON);
+
+    AplicaRegrasComerciais(retorno, _produtoRepository);
+
+    await SalvaLogs(retorno, logConsulta, logJSON, geoCodificacao, param, IpUsuario, IdUsuario);
+
+    return Ok(new
+    {
+        Error = false,
+        Message = string.Empty,
+        TempoExecucao = GetTempoExecucao(inicioExecucao),
+        Retorno = retorno
+    });
+}
+
+private async Task<ActionResult?> ValidaParametros(Param param, DateTime inicioExecucao, ViabilidadeEndereco retorno)
+{
+    if (param == null)
+    {
+        return Ok(new
+        {
+            Error = true,
+            Message = "Nenhum parâmetro identificado.",
+            TempoExecucao = GetTempoExecucao(inicioExecucao),
+            Retorno = retorno
+        });
+    }
+
+    param.Cep = GetAux.FormataCEP(param.Cep);
+    if (!GetAux.ValidaCEP(param.Cep))
+    {
+        return Ok(new
+        {
+            Error = true,
+            Message = "CEP inválido.",
+            TempoExecucao = GetTempoExecucao(inicioExecucao),
+            Retorno = retorno
+        });
+    }
+
+    param.Numero = GetAux.FormataNumeroEndereco(param.Numero);
+    if (!GetAux.ValidaNumeroEndereco(param.Numero))
+    {
+        return Ok(new
+        {
+            Error = true,
+            Message = "Número inválido.",
+            TempoExecucao = GetTempoExecucao(inicioExecucao),
+            Retorno = retorno
+        });
+    }
+
+    return null;
+}
+
+private async Task<(bool Sucesso, string Mensagem)> VerificaTokenCobertura(IConfiguration _config)
+{
+    if (string.IsNullOrEmpty(PublicConstants.TokenCobertura) || DateTime.Now >= PublicConstants.TokenCoberturaValidade)
+    {
+        Ambiente ambiente = (Ambiente)Convert.ToInt32(_config["Telefonica:IsProducao"]);
+        string respostaCobertura = await GerenciamentoAPIUtil.RefreshTokenAsync(ApiToken.Cobertura, ambiente, _config);
+
+        if (!string.IsNullOrEmpty(respostaCobertura))
+        {
+            return (false, "Não foi possível obter o Token de Cobertura.");
+        }
+    }
+    return (true, string.Empty);
+}
+
+private async Task<LocalidadeInfo?> ObterCep(Param param, ViabilidadeJson logJSON)
+{
+    var cep = await Task.Run(() => ConsultaCEP(param));
+    if (cep == null || cep.Count == 0 || cep[0] == null || (cep[0].error.HasValue && cep[0].error.Value))
+    {
+        return null;
+    }
+
+    logJSON.JsonCep = JsonConvert.SerializeObject(cep);
+    return cep[0];
+}
+
+private async Task<ApiReqGeolocalizacaoResp?> ObterGeolocalizacao(Param param, LocalidadeInfo cepResult, ViabilidadeJson logJSON)
+{
+    var geo = await Task.Run(() => ConsultaGeolocalizacao(new Param { Cep = param.Cep, Numero = param.Numero }));
+    if (geo == null || geo.Count == 0 || (geo.Any(f => f.error.HasValue && f.error.Value)))
+    {
+        return null;
+    }
+
+    logJSON.JsonGeocode = JsonConvert.SerializeObject(geo);
+    return geo[0];
+}
+
+private Municipio ObterMunicipio(ISimulacaoRepository repo, LocalidadeInfo cepResult)
+{
+    string uf = cepResult.sigla_uf.ToUpper();
+    string nomeMunicipio = cepResult.nome_localidade;
+    return repo.GetMunicipio(nomeMunicipio, uf).FirstOrDefault();
+}
+
+private void AjustaRetornoEndereco(Param param, LocalidadeInfo cepResult, ApiReqGeolocalizacaoResp geoCodificacao, Municipio objMunicipio, ViabilidadeEndereco retorno)
+{
+    retorno.IdMunicipio = objMunicipio.IdMunicipio;
+    retorno.Municipio = cepResult.nome_localidade;
+    retorno.UF = cepResult.sigla_uf;
+    retorno.CoordenadaXY = geoCodificacao.Coordenada;
+    retorno.Numero = param.Numero;
+    retorno.CEP = param.Cep;
+    retorno.Logradouro = geoCodificacao.logradouro;
+    retorno.Bairro = geoCodificacao.bairro;
+    retorno.EnderecoCompleto = geoCodificacao.endereco_completo;
+}
+
+private async Task<bool> ProcessarInventarioDisponibilidade(Param param, LocalidadeInfo cepResult, ApiReqGeolocalizacaoResp geoCodificacao, ViabilidadeEndereco retorno, ViabilidadeJson logJSON, IConfiguration _config)
+{
+    var inventario = await Task.Run(() => ConsultaInvetario(new inputEnderecoTecnico
+    {
+        cep = new Cep { cep = param.Cep, numero = param.Numero },
+        endereco = new Endereco
+        {
+            logradouro = geoCodificacao.logradouro,
+            numero = param.Numero,
+            bairro = geoCodificacao.bairro,
+            municipio = geoCodificacao.municipio,
+            uf = geoCodificacao.uf
+        },
+        Coordenadas = new List<Coordenada> {
+            new Coordenada {
+                Latitude = geoCodificacao.x.ToString(),
+                Longitude = geoCodificacao.y.ToString()
+            }
+        }
+    }));
+
+    if (inventario == null || inventario.Count == 0)
+        return false;
+
+    logJSON.JsonInventario = JsonConvert.SerializeObject(inventario);
+
+    retorno.Disponibilidades = inventario.Select(i => new Disponibilidade
+    {
+        IdTecnologia = i.idTecnologia,
+        DescTecnologia = i.tecnologia,
+        Rede = i.networkOwner,
+        DescricaoCompleta = i.tecnologia + " - " + i.networkOwner,
+        QtdeArmario = i.qtdeArmario,
+        QtdeLinhaTelefonica = i.qtdeLinhaTelefonica,
+        TecnologiaDeAcesso = i.TecnologiaDeAcesso,
+        VelocidadeMaximaDisponivel = i.VelocidadeMaximaDisponivel,
+        Critica = i.Critica
+    }).ToList();
+
+    retorno.HasDisponibilidade = retorno.Disponibilidades.Any();
+
+    return true;
+}
+
+private async Task VerificaCoberturaFallback(Param param, ViabilidadeEndereco retorno, ApiReqGeolocalizacaoResp geoCodificacao, ViabilidadeJson logJSON)
+{
+    var mancha = await Task.Run(() => ConsultaCobertura(new Param
+    {
+        Coordenada = geoCodificacao.Coordenada,
+        IdFamilia = param.IdFamilia
+    }));
+
+    if (mancha == null || mancha.error == true) return;
+
+    logJSON.JsonCobertura = JsonConvert.SerializeObject(mancha);
+
+    retorno.Coberturas = new List<Cobertura>();
+
+    if (mancha.HasGPON)
+    {
+        retorno.Coberturas.Add(new Cobertura
+        {
+            IdTecnologia = (int)Tecnologia.GPON,
+            DescTecnologia = "GPON",
+            DescricaoCompleta = "Cobertura GPON",
+            Rede = "VIVO",
+            Indice = 0
+        });
+        retorno.HasCobertura = true;
+    }
+    if (mancha.HasMetalico)
+    {
+        retorno.Coberturas.Add(new Cobertura
+        {
+            IdTecnologia = (int)Tecnologia.Metalico,
+            DescTecnologia = "Metalico",
+            DescricaoCompleta = "Cobertura Metalico",
+            Rede = "VIVO",
+            Indice = 1
+        });
+        retorno.HasCobertura = true;
+    }
+}
+
+private void AplicaRegrasComerciais(ViabilidadeEndereco retorno, IProdutoRepository _produtoRepository)
+{
+    var regras = _produtoRepository.GetMunicipioPrioRegra(new MunicipioPrioAux
+    {
+        TemGPON = retorno.Disponibilidades.Any(d => d.IdTecnologia == (int)Tecnologia.GPON),
+        TemMetalico = retorno.Disponibilidades.Any(d => d.IdTecnologia == (int)Tecnologia.Metalico)
+    });
+
+    foreach (var regra in regras)
+    {
+        foreach (var disp in retorno.Disponibilidades)
+        {
+            if (disp.IdTecnologia == regra.IdTecnologia && disp.Rede == regra.Rede)
+            {
+                disp.IsVisible = true;
+            }
+        }
+    }
+
+    retorno.Disponibilidades.RemoveAll(d => !d.IsVisible);
+}
+
+private async Task SalvaLogs(ViabilidadeEndereco retorno, ViabilidadeConsulta logConsulta, ViabilidadeJson logJSON, ApiReqGeolocalizacaoResp geoCodificacao, Param param, string ipUsuario, int idUsuario)
+{
+    logConsulta.CEP = param.Cep;
+    logConsulta.Numero = param.Numero;
+    logConsulta.IpUsuario = ipUsuario;
+    logConsulta.Latitude_X = Convert.ToDecimal(geoCodificacao.x);
+    logConsulta.Longitude_Y = Convert.ToDecimal(geoCodificacao.y);
+    logConsulta.IdUsuario = idUsuario;
+    logConsulta.Municipio = retorno.Municipio;
+    logConsulta.UF = retorno.UF;
+    logConsulta.Coordenadas = retorno.CoordenadaXY;
+    logConsulta.TempoExecucao = GetTempoExecucao(DateTime.Now);
+
+    retorno.IdConsulta = _viabilidadeRepository.PutViabilidadeConsulta(logConsulta);
+    logJSON.IdViabilidadeConsulta = retorno.IdConsulta;
+    _viabilidadeRepository.PutViabilidadeJson(logJSON);
+
+    retorno.Disponibilidades.ForEach(f =>
+        _viabilidadeRepository.PatchDisponibilidade(retorno.IdConsulta, f.IdDisponibilidade));
+}
+
+private object GerarRetornoErro(string mensagem, DateTime inicioExecucao, ViabilidadeEndereco retorno)
+{
+    return new
+    {
+        Error = true,
+        Message = mensagem,
+        TempoExecucao = GetTempoExecucao(inicioExecucao),
+        Retorno = retorno
+    };
+}
